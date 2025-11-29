@@ -15,7 +15,11 @@ class TrainerConfig:
     vocab_size: int                 
     num_epochs: int                 
 
-    use_ddp: bool                   
+    use_ddp: bool  
+    adap_factor: int
+    masked_token_id: int
+    pad_token_id: int
+    
     clean_cuda_cache: bool = True   # Helps prevent OOM errors during eval on large models
     use_compile: bool = True        # use torch.compile()
     use_dtype: str = "bfloat16"
@@ -33,13 +37,15 @@ class TrainerConfig:
 
     val_ratio: int = 0.005
     steps_for_eval: int = 20                            # number of steps for evaluation
-    eval_interval: int = 50
+    eval_interval: int = 700
 
-    checkpoints_frequency: int = 500
+    checkpoints_frequency: int = 2000
     path_to_checkpoints: str = "./model_testing"        # path to directory to save checkpoints
 
     tokenized_dataset_path: str = ""                    # path to directory with tokeized dataset
     eval_log_file: str = "logs/eval.txt"                # path to file to write eval results
+
+    
 
 
 
@@ -61,10 +67,16 @@ class DataLoader():
         self.val_len_dataset = self.len_dataset - self.train_len_dataset
 
         shard_size = self.len_dataset // world_size 
-        self.train_start_idx = rank * shard_size
-        self.train_end_idx = self.train_start_idx + shard_size
-        self.train_current_idx = self.train_start_idx
+        # self.train_start_idx = rank * shard_size
+        # self.train_end_idx = self.train_start_idx + shard_size
+        # self.train_current_idx = self.train_start_idx
 
+        # self.val_start_idx = self.train_len_dataset
+        # self.val_current_idx = self.val_start_idx
+        self.train_start_idx = 0
+        self.train_end_idx = self.train_len_dataset
+        self.train_current_idx = self.train_start_idx
+        
         self.val_start_idx = self.train_len_dataset
         self.val_current_idx = self.val_start_idx
 
@@ -110,13 +122,13 @@ class DataLoader():
 
     def load_dataset(self, seed: int):
         self.dataset = DatatroveFolderDataset(
-            folder_path=self.config.tokenized_dataset_path,
-            filename_pattern=os.path.join(self.config.tokenized_dataset_path, "**", "*.ds"),
+            folder_path=self.config.tokenized_dataset_path,  # e.g. "./fwe-10BT"
+            filename_pattern="*.ds",                         # pattern *inside* that folder
             seq_len=self.config.max_seq_len,
             token_size=self.token_size,
-            recursive=True,
+            recursive=False,                                # your .ds files are in the top level
             shuffle=True,
-            seed=seed + self.rank
+            seed=seed + self.rank,
         )
 
     def num_train_steps(self):
@@ -346,7 +358,7 @@ class Trainer():
 
                 # Logging 
                 if self.master_process:
-                    print(f"Epoch: {epoch} | Step: {step} |  loss: {accumulated_loss:.4f} | norm: {norm:.4f} | lr: {scheduler.get_last_lr()[0]} | tok/s: {tokens_per_sec}")
+                    print(f"Epoch: {epoch} | Step: {step} |  loss: {accumulated_loss.item():.4f} | norm: {norm:.4f} | lr: {scheduler.get_last_lr()[0]} | tok/s: {tokens_per_sec}")
                 
                 # Evaluation 
                 if self.master_process and ((step>0 and step % self.config.eval_interval == 0) or step == last_step):
@@ -354,7 +366,7 @@ class Trainer():
                     val_loss = self.eval(data_loader)
 
                     with open(self.config.eval_log_file, "a") as f:
-                        f.write(f"Step: {step * (epoch+1)}, val_loss: {val_loss:.4f}, norm: {norm:.4f}, lr: {scheduler.get_last_lr()[0]}, time: {t1 - t0:.2f}s, tok/s: {tokens_per_sec:.1f} \n")
+                        f.write(f"Step: {step * (epoch+1)}, val_loss: {val_loss.item():.4f}, norm: {norm:.4f}, lr: {scheduler.get_last_lr()[0]}, time: {t1 - t0:.2f}s, tok/s: {tokens_per_sec:.1f} \n")
 
                     self.model.train()
                     if self.clean_cuda_cache:
@@ -364,54 +376,47 @@ class Trainer():
                 if self.master_process and ((step % self.config.checkpoints_frequency == 0 and step > 0) or step == last_step):
                     self.save_checkpoints(optimizer, self.config.path_to_checkpoints, name=str((epoch+1) * step))
     
-        def eval(self, data_loader):
-            """
-            Evaluates model on validation split using running average of
-            first [steps_for_eval] batches under the same diffusion objective.
-            """
-            eps = 1e-4
-            val_loss_accum = 0.0
-            effective_steps = 0
+    def eval(self, data_loader):
+        """
+        Evaluates model on validation split using running average of
+        first [steps_for_eval] batches under the same diffusion objective.
+        """
+        eps = 1e-4
+        val_loss_accum = 0.0
+        effective_steps = 0
 
-            with torch.no_grad():
-                for _ in range(self.steps_for_eval):
-                    # 1) Get a validation batch
-                    x0 = data_loader.next_batch(split="val").to(self.device)
+        with torch.no_grad():
+            for _ in range(self.steps_for_eval):
+                x0 = data_loader.next_batch(split="val").to(self.device)
 
-                    # 2) Sample time and corrupt with absorbing noise
-                    tau = torch.rand(1, device=self.device)
-                    tau = tau.clamp(min=eps)
-                    xt = self._apply_mask_noise(x0, tau)
+                tau = torch.rand(1, device=self.device)
+                tau = tau.clamp(min=eps)
+                xt = self._apply_mask_noise(x0, tau)
 
-                    # 3) Full bidirectional attention at eval
-                    attn_mask = self._get_mask_for_step(
-                        seq_len=xt.size(1),
-                        progress=1.0,    # fully annealed mask
-                    )
+                attn_mask = self._get_mask_for_step(
+                    seq_len=xt.size(1),
+                    progress=1.0,    # fully annealed mask
+                )
 
-                    # 4) Masked positions = where xt == [MASK] (excluding pad)
-                    masked_positions = (xt == self.masked_token_id)
-                    if self.pad_token_id is not None:
-                        masked_positions &= (x0 != self.pad_token_id)
+                masked_positions = (xt == self.masked_token_id)
+                if self.pad_token_id is not None:
+                    masked_positions &= (x0 != self.pad_token_id)
 
-                    # It *can* happen there are no masked tokens for very small tau;
-                    # skip those batches so we don't step on stale gradients.
-                    if masked_positions.sum() == 0:
-                        continue
+                if masked_positions.sum() == 0:
+                    continue
 
-                    # 5) Forward + loss, scaled by 1/tau
-                    with torch.autocast(device_type=self.device.type, dtype=self.dtype):
-                        _, loss = self.model(xt, x0, attn_mask, masked_positions)
-                        loss = loss / tau.to(loss.dtype)
+                with torch.autocast(device_type=self.device.type, dtype=self.dtype):
+                    _, loss = self.model(xt, x0, attn_mask, masked_positions)
+                    loss = loss / tau.to(loss.dtype)
 
-                    val_loss_accum += loss.detach().float()
-                    effective_steps += 1
+                val_loss_accum += loss.detach().float()
+                effective_steps += 1
 
-            if effective_steps == 0:
-                # extremely unlikely, but just in case
-                return torch.tensor(0.0, device=self.device)
+        if effective_steps == 0:
+            # extremely unlikely, but just in case
+            return torch.tensor(0.0, device=self.device)
 
-            return val_loss_accum / effective_steps
+        return val_loss_accum / effective_steps
 
 
     def save_checkpoints(self, optimizer, path: str, name: str):

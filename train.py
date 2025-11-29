@@ -1,197 +1,234 @@
 import os
 import gc
+import argparse
+from typing import Tuple
+
 import torch
-import torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from datatrove.utils.dataset import DatatroveFolderDataset
 
 from ARmodel import Transformer, ModelConfig
-from trainer import Trainer, TrainerConfig
+from trainer import Trainer, TrainerConfig, DataLoader
 
-def load_qwen_into_custom_model(model_id="Qwen/Qwen2.5-1.5B-Instruct", device="cuda"):
-    print(f"Loading HF Model: {model_id}...")
+
+def load_qwen_into_custom_model(
+    model_id: str = "Qwen/Qwen2.5-Coder-0.5B",
+    device: str = "cuda",
+    dtype: torch.dtype = torch.bfloat16,
+    mask_token_id: int = 0,
+) -> Tuple[Transformer, AutoTokenizer]:
+    """
+    Load a HuggingFace Qwen model, build the matching custom Transformer,
+    and copy over the weights into your AR2DLLM architecture.
+    """
+    print(f"Loading HF model: {model_id}...")
     hf_model = AutoModelForCausalLM.from_pretrained(
-        model_id, 
-        torch_dtype=torch.float16, 
-        device_map="cpu", 
-        trust_remote_code=True
+        model_id,
+        torch_dtype=torch.float16,
+        device_map="cpu",
+        trust_remote_code=True,
     )
     hf_config = hf_model.config
-    
-    print("Mapping Configuration...")
-    config = ModelConfig(
+
+    print("Loading tokenizer...")
+    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+    if tokenizer.mask_token_id is not None:
+        mask_token_id = tokenizer.mask_token_id
+        print("masked token in tokenizer")
+    elif tokenizer.additional_special_tokens_ids:
+        mask_token_id = tokenizer.additional_special_tokens_ids[0]
+        print("masked token in additional_special_tokens_ids now")
+    else:
+        mask_token_id = tokenizer.eos_token_id
+        print("masked token is eos")
+    print("mask_token: ", mask_token_id)
+        
+
+    model_config = ModelConfig(
         vocab_size=hf_config.vocab_size,
         num_dims=hf_config.hidden_size,
         num_heads=hf_config.num_attention_heads,
-        num_kv_heads=hf_config.num_key_value_heads,
+        num_kv_heads=getattr(hf_config, "num_key_value_heads", hf_config.num_attention_heads),
         num_layers=hf_config.num_hidden_layers,
         ffn_hidden_dims=hf_config.intermediate_size,
         context_len=hf_config.max_position_embeddings,
-        use_cache=False,                    # Disable cache for training
-        use_flash=True,                     # Enable Flash Attention if available
-        attention_bias=True,                # Qwen uses bias for Q, K, V
-        attention_out_bias=False,           # No bias for Output
-        mlp_bias=False,                     # No bias for MLP
+
+
+        use_cache=False,                # disable cache during training
+        use_flash=True,                 # enable Flash attention if available
+        attention_bias=True,            # Qwen uses bias in q/k/v projections
+        attention_out_bias=False,       # usually no bias on o_proj
+        mlp_bias=False,
         tie_weights=False,
-        rmsnorm_eps=hf_config.rms_norm_eps,
-        rope_theta=hf_config.rope_theta,
+        rmsnorm_eps=getattr(hf_config, "rms_norm_eps", 1e-6),
+        rope_theta=getattr(hf_config, "rope_theta", 1e6),
+        mask_token_id=mask_token_id,
     )
-    
-    print(f"Initializing Custom Model with config: {config}")
-    custom_model = Transformer(config).to(dtype=torch.float16)
-    
+
+    print(f"Initializing custom Transformer with config: {model_config}")
+    custom_model = Transformer(model_config).to(dtype=torch.float16)
+
     hf_sd = hf_model.state_dict()
     custom_sd = custom_model.state_dict()
-    
+
     mapping = {}
-    
+
     mapping["tokens_embedding.weight"] = "model.embed_tokens.weight"
     mapping["ll_head.weight"] = "lm_head.weight"
     mapping["norm.weight"] = "model.norm.weight"
-    
-    # --- 2. Layers ---
-    for i in range(config.num_layers):
-        # Attention Weights
+
+    for i in range(model_config.num_layers):
+        # Attention projections
         mapping[f"blocks.{i}.attention.wq.weight"] = f"model.layers.{i}.self_attn.q_proj.weight"
         mapping[f"blocks.{i}.attention.wk.weight"] = f"model.layers.{i}.self_attn.k_proj.weight"
         mapping[f"blocks.{i}.attention.wv.weight"] = f"model.layers.{i}.self_attn.v_proj.weight"
         mapping[f"blocks.{i}.attention.wo.weight"] = f"model.layers.{i}.self_attn.o_proj.weight"
-        
-        # Attention Biases
-        if config.attention_bias:
+
+        # Attention biases
+        if model_config.attention_bias:
             mapping[f"blocks.{i}.attention.wq.bias"] = f"model.layers.{i}.self_attn.q_proj.bias"
             mapping[f"blocks.{i}.attention.wk.bias"] = f"model.layers.{i}.self_attn.k_proj.bias"
             mapping[f"blocks.{i}.attention.wv.bias"] = f"model.layers.{i}.self_attn.v_proj.bias"
-        
-        if config.attention_out_bias:
+
+        if model_config.attention_out_bias:
             mapping[f"blocks.{i}.attention.wo.bias"] = f"model.layers.{i}.self_attn.o_proj.bias"
 
-        # FFN Weights
+        # MLP projections
         mapping[f"blocks.{i}.ffn.w1.weight"] = f"model.layers.{i}.mlp.gate_proj.weight"
         mapping[f"blocks.{i}.ffn.w3.weight"] = f"model.layers.{i}.mlp.up_proj.weight"
         mapping[f"blocks.{i}.ffn.w2.weight"] = f"model.layers.{i}.mlp.down_proj.weight"
-        
-        if config.mlp_bias:
+
+        if model_config.mlp_bias:
             mapping[f"blocks.{i}.ffn.w1.bias"] = f"model.layers.{i}.mlp.gate_proj.bias"
             mapping[f"blocks.{i}.ffn.w3.bias"] = f"model.layers.{i}.mlp.up_proj.bias"
             mapping[f"blocks.{i}.ffn.w2.bias"] = f"model.layers.{i}.mlp.down_proj.bias"
-        
-        # Norms
+
+        # Layer norms
         mapping[f"blocks.{i}.norm_attention.weight"] = f"model.layers.{i}.input_layernorm.weight"
         mapping[f"blocks.{i}.norm_ffn.weight"] = f"model.layers.{i}.post_attention_layernorm.weight"
 
-    print("Copying Weights...")
+    print("Copying weights...")
+    missing_in_hf = []
+    missing_in_custom = []
+
     for custom_key, hf_key in mapping.items():
         if hf_key in hf_sd and custom_key in custom_sd:
             if custom_sd[custom_key].shape != hf_sd[hf_key].shape:
-                print(f"Shape mismatch: {custom_key} {custom_sd[custom_key].shape} vs {hf_key} {hf_sd[hf_key].shape}")
+                print(
+                    f"Shape mismatch for {custom_key}: "
+                    f"{custom_sd[custom_key].shape} vs HF {hf_key} {hf_sd[hf_key].shape}"
+                )
                 continue
             with torch.no_grad():
                 custom_sd[custom_key].copy_(hf_sd[hf_key])
         else:
             if hf_key not in hf_sd:
-                print(f"WARNING: HF Key {hf_key} not found")
+                missing_in_hf.append(hf_key)
             if custom_key not in custom_sd:
-                print(f"WARNING: Custom Key {custom_key} not found")
+                missing_in_custom.append(custom_key)
 
-    print("Weights Loaded Successfully.")
-    
-    # Cleanup HF model to free memory
+    if missing_in_hf:
+        print("WARNING: some HF keys not found:", missing_in_hf)
+    if missing_in_custom:
+        print("WARNING: some custom keys not found:", missing_in_custom)
+
     del hf_model
-    del hf_sd
     gc.collect()
-    torch.cuda.empty_cache()
-    
-    return custom_model.to(device)
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
-def generate_text(model, tokenizer, prompt, max_new_tokens=50):
-    model.eval()
-    device = next(model.parameters()).device
-    
-    inputs = tokenizer(prompt, return_tensors="pt").to(device)
-    input_ids = inputs.input_ids
-    
-    print(f"\nPrompt: {prompt}")
-    print("Generating...", end="", flush=True)
-    
-    with torch.no_grad():
-        for next_token in model.generate(input_ids, max_new_tokens):
-            word = tokenizer.decode(next_token[0])
-            print(word, end="", flush=True)
-            if next_token.item() == tokenizer.eos_token_id:
-                break
-    print("\n\nDone.")
+    custom_model = custom_model.to(device=device, dtype=dtype)
+
+    return custom_model, tokenizer, mask_token_id
 
 
 def main():
-    MODEL_ID = "Qwen/Qwen2.5-1.5B-Instruct"
-    DATA_PATH = "./data"
-    OUTPUT_PATH = "./checkpoints"
-    
-    if not os.path.exists(DATA_PATH):
-        print(f"WARNING: Data path '{DATA_PATH}' does not exist.")
-        print("Please create this folder and put your training data (parquet/jsonl) inside.")
-        os.makedirs(DATA_PATH, exist_ok=True)
+    parser = argparse.ArgumentParser(description="Train Diffusion Language Model adapted from Qwen.")
+    parser.add_argument("--model_id", type=str, default="Qwen/Qwen2.5-Coder-0.5B")
+    parser.add_argument(
+        "--dataset_path",
+        type=str,
+        default="./fwe-10BT",  
+        help="Path to tokenized Datatrove dataset (folder that contains .ds files).",
+    )
+    parser.add_argument("--output_dir", type=str, default="./checkpoints")
+    parser.add_argument("--num_epochs", type=int, default=1)
+    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--max_seq_len", type=int, default=1536)
+    parser.add_argument("--learning_rate", type=float, default=2e-4)
+    parser.add_argument("--warmup_ratio", type=float, default=0.01)
+    parser.add_argument("--use_ddp", action="store_true")
+    parser.add_argument("--use_compile", action="store_true")
+    parser.add_argument(
+        "--precision",
+        type=str,
+        default="bfloat16",
+        choices=["bfloat16", "float16", "float32"],
+        help="Training compute dtype.",
+    )
+    parser.add_argument("--mask_token_id", type=int, default=0)
+    parser.add_argument("--adap_factor", type=float, default=1.0)
+    parser.add_argument("--num_epochs_total", type=int, help="Alias for --num_epochs", default=None)
 
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
-    vocab_size = tokenizer.vocab_size
+    args = parser.parse_args()
+
+    if args.num_epochs_total is not None:
+        args.num_epochs = args.num_epochs_total
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = load_qwen_into_custom_model(MODEL_ID, device=device)
+    dtype = getattr(torch, args.precision)
+
+    print(f"Using device: {device}, dtype: {dtype}")
+
     
-    model.gradient_checkpointing_enable() 
-    try:
-        dataset = DatatroveFolderDataset(
-            DATA_PATH, 
-            extension=".parquet", 
-            seq_len=model.config.context_len
-        )
-    except Exception as e:
-        print(f"Error loading dataset: {e}")
-        print("Falling back to a dummy dataset for demonstration purposes...")
-        class DummyDataset:
-            def __init__(self, size=100, seq_len=1024):
-                self.data = [
-                    {"input_ids": torch.randint(0, vocab_size, (seq_len + 1,)).tolist()} 
-                    for _ in range(size)
-                ]
-            def __len__(self): return len(self.data)
-            def __getitem__(self, i): return self.data[i]
+
         
-        dataset = DummyDataset(size=1000, seq_len=model.config.context_len)
+    model, tokenizer, mask_token_id = load_qwen_into_custom_model(
+        model_id=args.model_id,
+        device=device,
+        dtype=dtype,
+        mask_token_id=args.mask_token_id,
+    )
+    print("model mask token is: ", mask_token_id)
 
+    pad_token_id = tokenizer.pad_token_id
+    if pad_token_id is None:
+        pad_token_id = tokenizer.eos_token_id
 
-    train_config = TrainerConfig(
-        vocab_size=vocab_size,
-        num_epochs=1,
-        use_ddp=False,
-        batch_size=2,
-        accumulation_steps=8,
-        max_seq_len=model.config.context_len,
-        learning_rate=5e-5,
-        path=OUTPUT_PATH,
-        checkpoints_frequency=500,
-        eval_interval=200,
-        use_dtype="bfloat16" if torch.cuda.is_bf16_supported() else "float16"
+    trainer_config = TrainerConfig(
+        vocab_size=tokenizer.vocab_size,
+        num_epochs=args.num_epochs,
+        use_ddp=args.use_ddp,
+        clean_cuda_cache=True,
+        use_compile=True,
+        use_dtype=args.precision,
+        max_seq_len=args.max_seq_len,
+        batch_size=args.batch_size,
+        accumulation_steps=10,
+        learning_rate=args.learning_rate,
+        warmup_ratio=args.warmup_ratio,
+        tokenized_dataset_path=args.dataset_path,
+        path_to_checkpoints=args.output_dir,
+        masked_token_id=mask_token_id,
+        pad_token_id=pad_token_id,
+        adap_factor=args.adap_factor,
     )
 
-    print(f"Starting training on {device}...")
-    
-    trainer = Trainer(
-        model=model,
-        config=train_config,
-        train_dataset=dataset,
-        val_dataset=DummyDataset
-    )
+    os.makedirs(trainer_config.path_to_checkpoints, exist_ok=True)
+    log_dir = os.path.dirname(trainer_config.eval_log_file)
+    if log_dir:
+        os.makedirs(log_dir, exist_ok=True)
+
+    data_loader = DataLoader(trainer_config)
+    trainer = Trainer(trainer_config, model, tokenizer)
 
     try:
-        trainer.train()
+        trainer.train(data_loader)
     except KeyboardInterrupt:
-        print("Training interrupted. Saving final checkpoint...")
-        trainer.save_checkpoints(trainer.optimizer, OUTPUT_PATH, "interrupted")
+        print("Training interrupted by user.")
     except Exception as e:
-        print(f"An error occurred during training: {e}")
+        print(f"Error during training: {e}")
         raise
+
 
 if __name__ == "__main__":
     main()

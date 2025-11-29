@@ -90,18 +90,15 @@ class GroupedQueryAttention(nn.Module):
         self.num_rep = self.num_heads // self.num_kv_heads
         self.head_dim = config.num_dims // self.num_heads
 
-        # FIX: Use config.attention_bias to determine if Linear layers need bias
         self.wq = nn.Linear(config.num_dims, config.num_dims, bias=config.attention_bias)
         self.wk = nn.Linear(config.num_dims, self.num_kv_heads * self.head_dim, bias=config.attention_bias)
         self.wv = nn.Linear(config.num_dims, self.num_kv_heads * self.head_dim, bias=config.attention_bias)
         
-        # Initialize weights (standard practice, though we load pretrained later)
         # Only init weight, bias is init by default if it exists
         nn.init.normal_(self.wq.weight, mean=0, std=1/math.sqrt(config.num_dims))
         nn.init.normal_(self.wk.weight, mean=0, std=1/math.sqrt(config.num_dims))
         nn.init.normal_(self.wv.weight, mean=0, std=1/math.sqrt(config.num_dims))
         
-        # FIX: Use config.attention_out_bias
         self.wo = nn.Linear(config.num_dims, config.num_dims, bias=config.attention_out_bias)
 
     def rotate_half(self, x):
@@ -153,7 +150,7 @@ class GroupedQueryAttention(nn.Module):
 
 
         # 5. Normalize attn_mask
-        # Expect attn_mask as bool [T, T] or [B, H, T, T], True=masked
+        # Expect attn_mask as bool [T, T] or [B, H, T, T], True=ALLOWED
         if attn_mask is not None and attn_mask.dim() == 2:
             attn_mask = attn_mask[None, None, :, :]   # [1, 1, T, T] -> broadcast
 
@@ -164,7 +161,7 @@ class GroupedQueryAttention(nn.Module):
             # Manual attention
             scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
             if attn_mask is not None:
-                scores = scores.masked_fill(attn_mask, float("-inf"))     
+                scores = scores.masked_fill(~attn_mask, float("-inf"))     
             attention = F.softmax(scores, dim=-1)
             output = torch.matmul(attention, v)
 
@@ -196,8 +193,8 @@ class Block(nn.Module):
         self.norm_attention = RMSNorm(config)
         self.norm_ffn = RMSNorm(config)
 
-    def forward(self, x, cos, sin, start_pos, attn_mask):
-        h = x + self.attention(self.norm_attention(x), cos, sin, start_pos, attn_mask)
+    def forward(self, x, cos, sin, attn_mask):
+        h = x + self.attention(self.norm_attention(x), cos, sin, attn_mask=attn_mask)
         out, _ = self.ffn(self.norm_ffn(h))
         return h + out, 0
 
@@ -260,19 +257,50 @@ class Transformer(nn.Module):
         return logits, loss
 
     @torch.no_grad()
-    def generate(self, x: torch.Tensor, max_tokens: int, temperature: float = 1.0, top_k: int = 50):
+    def generate(self, idx: torch.Tensor, max_new_tokens: int, steps: int = 50, temperature: float = 1.0):
+        """
+        generation for the Diffusion Language Model.
+        """
         self.eval()
-        for _ in range(max_tokens):
-            # Naive generation: Pass full sequence every time
-            logits, _ = self.forward(x, start_pos=0) 
-            logits = logits[:, -1, :] / temperature
-            
-            if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float('Inf')
+        B, T_prompt = idx.shape
+        T_total = T_prompt + max_new_tokens
 
-            probs = F.softmax(logits, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)
-            x = torch.cat((x, next_token), dim=1)
-            yield next_token 
+        x = torch.full((B, T_total), self.config.mask_token_id, device=idx.device, dtype=torch.long)
+        x[:, :T_prompt] = idx
+        
+
+        for step in range(steps):
+            progress = (step + 1) / steps
+
+            mask_ratio = np.cos(progress * np.pi / 2)
+            num_to_mask = int(max_new_tokens * mask_ratio)
+
+            logits, _ = self.forward(x)
+            
+  
+            gen_logits = logits[:, T_prompt:, :] 
+            
+            if temperature > 0:
+                probs = torch.softmax(gen_logits / temperature, dim=-1)
+                pred_ids = torch.multinomial(probs.view(-1, self.config.vocab_size), 1).view(B, max_new_tokens)
+                pred_probs = torch.gather(probs, -1, pred_ids.unsqueeze(-1)).squeeze(-1)
+            else:
+                probs = torch.softmax(gen_logits, dim=-1)
+                pred_ids = torch.argmax(probs, dim=-1)
+                pred_probs = torch.max(probs, dim=-1).values
+
+
+            x[:, T_prompt:] = pred_ids
+            
+            if step == steps - 1:
+                break
+
+            if num_to_mask > 0:
+
+                _, mask_indices = torch.topk(pred_probs, k=num_to_mask, dim=1, largest=False)
+ 
+                global_mask_indices = mask_indices + T_prompt
+                
+                x.scatter_(1, global_mask_indices, self.config.mask_token_id)
+
         return x
