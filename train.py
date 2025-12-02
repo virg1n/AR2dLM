@@ -15,10 +15,13 @@ def load_qwen_into_custom_model(
     device: str = "cuda",
     dtype: torch.dtype = torch.bfloat16,
     mask_token_id: int = 0,
-) -> Tuple[Transformer, AutoTokenizer]:
+) -> Tuple[Transformer, AutoTokenizer, int, int]:
     """
-    Load a HuggingFace Qwen model, build the matching custom Transformer,
-    and copy over the weights into your AR2DLLM architecture.
+    Load a HuggingFace Qwen model, ensure a dedicated <MASK> token exists,
+    build the matching custom Transformer, and copy over the weights.
+
+    Returns:
+        custom_model, tokenizer, mask_token_id, vocab_size_total
     """
     print(f"Loading HF model: {model_id}...")
     hf_model = AutoModelForCausalLM.from_pretrained(
@@ -31,28 +34,41 @@ def load_qwen_into_custom_model(
 
     print("Loading tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
-    if tokenizer.mask_token_id is not None:
-        mask_token_id = tokenizer.mask_token_id
-        print("masked token in tokenizer")
-    elif tokenizer.additional_special_tokens_ids:
-        mask_token_id = tokenizer.additional_special_tokens_ids[0]
-        print("masked token in additional_special_tokens_ids now")
+
+    if tokenizer.mask_token is None:
+        vocab = tokenizer.get_vocab()
+        if "<MASK>" in vocab:
+            print("Found existing '<MASK>' token in vocab, using it as mask_token.")
+            tokenizer.mask_token = "<MASK>"
+        else:
+            print("No mask_token found. Adding '<MASK>' as mask_token.")
+            special_tokens = {"mask_token": "<MASK>"}
+            num_added = tokenizer.add_special_tokens(special_tokens)
+            print(f"Added {num_added} new special token(s): {special_tokens}")
+
+        hf_model.resize_token_embeddings(len(tokenizer))
     else:
-        mask_token_id = tokenizer.eos_token_id
-        print("masked token is eos")
-    print("mask_token: ", mask_token_id)
-        
+        print(f"Tokenizer already has a mask token: {tokenizer.mask_token}")
+
+    mask_token_id = tokenizer.mask_token_id
+    if mask_token_id is None:
+        mask_token_id = tokenizer.convert_tokens_to_ids("<MASK>")
+    print("Using mask_token_id:", mask_token_id)
+
+    vocab_size_total = hf_model.get_input_embeddings().weight.size(0)
+    print("HF embedding vocab size (total):", vocab_size_total)
+    print("tokenizer.vocab_size (base):", tokenizer.vocab_size)
+    print("len(tokenizer) (total):", len(tokenizer))
 
     model_config = ModelConfig(
-        vocab_size=hf_config.vocab_size,
+        vocab_size=vocab_size_total,
         num_dims=hf_config.hidden_size,
         num_heads=hf_config.num_attention_heads,
         num_kv_heads=getattr(hf_config, "num_key_value_heads", hf_config.num_attention_heads),
         num_layers=hf_config.num_hidden_layers,
         ffn_hidden_dims=hf_config.intermediate_size,
         context_len=hf_config.max_position_embeddings,
-
-
+        # architecture flags
         use_cache=False,                # disable cache during training
         use_flash=True,                 # enable Flash attention if available
         attention_bias=True,            # Qwen uses bias in q/k/v projections
@@ -72,10 +88,12 @@ def load_qwen_into_custom_model(
 
     mapping = {}
 
+    # Embeddings + output head + final norm
     mapping["tokens_embedding.weight"] = "model.embed_tokens.weight"
     mapping["ll_head.weight"] = "lm_head.weight"
     mapping["norm.weight"] = "model.norm.weight"
 
+    # Transformer blocks
     for i in range(model_config.num_layers):
         # Attention projections
         mapping[f"blocks.{i}.attention.wq.weight"] = f"model.layers.{i}.self_attn.q_proj.weight"
@@ -138,7 +156,7 @@ def load_qwen_into_custom_model(
 
     custom_model = custom_model.to(device=device, dtype=dtype)
 
-    return custom_model, tokenizer, mask_token_id
+    return custom_model, tokenizer, mask_token_id, vocab_size_total
 
 
 def main():
@@ -147,13 +165,13 @@ def main():
     parser.add_argument(
         "--dataset_path",
         type=str,
-        default="./fwe-10BT",  
+        default="./fine_code", 
         help="Path to tokenized Datatrove dataset (folder that contains .ds files).",
     )
     parser.add_argument("--output_dir", type=str, default="./checkpoints")
     parser.add_argument("--num_epochs", type=int, default=1)
     parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--max_seq_len", type=int, default=1536)
+    parser.add_argument("--max_seq_len", type=int, default=2048)
     parser.add_argument("--learning_rate", type=float, default=2e-4)
     parser.add_argument("--warmup_ratio", type=float, default=0.01)
     parser.add_argument("--use_ddp", action="store_true")
@@ -166,7 +184,7 @@ def main():
         help="Training compute dtype.",
     )
     parser.add_argument("--mask_token_id", type=int, default=0)
-    parser.add_argument("--adap_factor", type=float, default=1.0)
+    parser.add_argument("--adap_factor", type=float, default=0.9)
     parser.add_argument("--num_epochs_total", type=int, help="Alias for --num_epochs", default=None)
 
     args = parser.parse_args()
@@ -174,28 +192,34 @@ def main():
     if args.num_epochs_total is not None:
         args.num_epochs = args.num_epochs_total
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if torch.cuda.is_available():
+        if args.use_ddp and "LOCAL_RANK" in os.environ:
+            local_rank = int(os.environ["LOCAL_RANK"])
+            device = f"cuda:{local_rank}"
+        else:
+            device = "cuda:0"
+    else:
+        device = "cpu"
     dtype = getattr(torch, args.precision)
 
     print(f"Using device: {device}, dtype: {dtype}")
 
-    
-
-        
-    model, tokenizer, mask_token_id = load_qwen_into_custom_model(
+    model, tokenizer, mask_token_id, vocab_size_total = load_qwen_into_custom_model(
         model_id=args.model_id,
         device=device,
         dtype=dtype,
         mask_token_id=args.mask_token_id,
     )
     print("model mask token is: ", mask_token_id)
+    print("tokenier's mask token: ")
+    print(tokenizer.convert_ids_to_tokens(151665))
 
     pad_token_id = tokenizer.pad_token_id
     if pad_token_id is None:
         pad_token_id = tokenizer.eos_token_id
 
     trainer_config = TrainerConfig(
-        vocab_size=tokenizer.vocab_size,
+        vocab_size=vocab_size_total,  # use total vocab size (matches embeddings & mask id)
         num_epochs=args.num_epochs,
         use_ddp=args.use_ddp,
         clean_cuda_cache=True,
@@ -218,8 +242,13 @@ def main():
     if log_dir:
         os.makedirs(log_dir, exist_ok=True)
 
-    data_loader = DataLoader(trainer_config)
     trainer = Trainer(trainer_config, model, tokenizer)
+
+    data_loader = DataLoader(
+        trainer_config,
+        rank=trainer.ddp_rank,
+        world_size=trainer.ddp_world_size,
+    )
 
     try:
         trainer.train(data_loader)

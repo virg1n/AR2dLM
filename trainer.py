@@ -9,6 +9,8 @@ import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from datatrove.utils.dataset import DatatroveFolderDataset
+import torch.distributed as dist
+
 
 @dataclass
 class TrainerConfig:
@@ -37,9 +39,9 @@ class TrainerConfig:
 
     val_ratio: int = 0.005
     steps_for_eval: int = 20                            # number of steps for evaluation
-    eval_interval: int = 700
+    eval_interval: int = 300
 
-    checkpoints_frequency: int = 2000
+    checkpoints_frequency: int = 10000
     path_to_checkpoints: str = "./model_testing"        # path to directory to save checkpoints
 
     tokenized_dataset_path: str = ""                    # path to directory with tokeized dataset
@@ -66,19 +68,30 @@ class DataLoader():
         self.train_len_dataset = math.ceil((1-config.val_ratio) * self.len_dataset)
         self.val_len_dataset = self.len_dataset - self.train_len_dataset
 
-        shard_size = self.len_dataset // world_size 
-        # self.train_start_idx = rank * shard_size
-        # self.train_end_idx = self.train_start_idx + shard_size
-        # self.train_current_idx = self.train_start_idx
+        # shard_size = self.len_dataset // world_size 
+        # # self.train_start_idx = rank * shard_size
+        # # self.train_end_idx = self.train_start_idx + shard_size
+        # # self.train_current_idx = self.train_start_idx
 
+        # # self.val_start_idx = self.train_len_dataset
+        # # self.val_current_idx = self.val_start_idx
+        # self.train_start_idx = 0
+        # self.train_end_idx = self.train_len_dataset
+        # self.train_current_idx = self.train_start_idx
+        
         # self.val_start_idx = self.train_len_dataset
         # self.val_current_idx = self.val_start_idx
-        self.train_start_idx = 0
-        self.train_end_idx = self.train_len_dataset
+        shard_size = math.ceil(self.train_len_dataset / world_size)
+
+        self.train_start_idx = rank * shard_size
+        self.train_end_idx = min(self.train_start_idx + shard_size, self.train_len_dataset)
         self.train_current_idx = self.train_start_idx
-        
+
+        # validation: everyone sees the full validation set (simple & fine),
+        # or you could also shard similarly if you prefer.
         self.val_start_idx = self.train_len_dataset
         self.val_current_idx = self.val_start_idx
+
 
     def get_batch(self, current_idx: int, start_idx: int, end_idx: int):
         new_idx = current_idx + self.config.batch_size
@@ -108,9 +121,9 @@ class DataLoader():
 
         self.val_len_dataset = self.len_dataset - self.train_len_dataset
 
-        shard_size = self.len_dataset // world_size 
+        shard_size = math.ceil(self.train_len_dataset / world_size)
         self.train_start_idx = rank * shard_size
-        self.train_end_idx = self.train_start_idx + shard_size
+        self.train_end_idx = min(self.train_start_idx + shard_size, self.train_len_dataset)
         self.train_current_idx = self.train_start_idx
 
         self.val_start_idx = self.train_len_dataset
@@ -161,27 +174,40 @@ class Trainer():
         if use_compile:
             self.model = torch.compile(self.model)
             
-        # DDP
-        if n_gpus > 1 and config.use_ddp:   
+        if n_gpus > 1 and config.use_ddp:
             self.ddp = True
-            self.ddp_rank = int(os.environ['RANK'])
-            self.ddp_local_rank = int(os.environ['LOCAL_RANK'])
-            self.ddp_world_size = int(os.environ['WORLD_SIZE'])
+
+            # --- NEW: initialize process group ---
+            if not dist.is_initialized():
+                dist.init_process_group(backend="nccl")
+
+            self.ddp_rank = dist.get_rank()
+            self.ddp_world_size = dist.get_world_size()
+            # torchrun sets LOCAL_RANK; fall back to rank 0 if not present
+            self.ddp_local_rank = int(os.environ.get("LOCAL_RANK", self.ddp_rank))
+
             self.device = torch.device(f"cuda:{self.ddp_local_rank}")
             torch.cuda.set_device(self.device)
             self.master_process = self.ddp_rank == 0
 
             self.model.to(self.device)
-            
-            self.model = DDP(self.model, device_ids=[self.ddp_local_rank])
-            self.raw_m = model
+
+            # Wrap with DDP on the local device
+            self.model = DDP(
+                self.model,
+                device_ids=[self.ddp_local_rank],
+                output_device=self.ddp_local_rank,
+                find_unused_parameters=False,
+            )
+            self.raw_m = self.model.module  # underlying model
         else:
             self.ddp = False
             self.ddp_rank = 0
             self.ddp_world_size = 1
             self.master_process = True
 
-            if self.device != "cpu":
+            self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+            if self.device.type != "cpu":
                 self.model.to(self.device)
 
         if self.master_process:
@@ -281,6 +307,7 @@ class Trainer():
 
         with torch.autocast(device_type=self.device.type, dtype=self.dtype):
             _, loss = self.model(xt, x0, attn_mask, masked_positions)
+            print(f"loss_before_divide: {loss}")
             loss = loss / tau.to(loss.dtype)
 
         loss = loss / accumulation_steps
@@ -325,7 +352,7 @@ class Trainer():
 
         for epoch in range(self.num_epochs):
             for step in range(num_steps_per_epoch):
-                progress = min(step/(num_steps_per_epoch * self.adap_factor) + int(epoch), 1.0)
+                progress = min(step/(num_steps_per_epoch * self.adap_factor) + int(epoch), 1.0) * 2
 
                 tau = torch.rand(1, device=self.device)
                 tau = tau.clamp(min=eps)
@@ -338,15 +365,15 @@ class Trainer():
                 with ddp_nosync_ctx:
                     for _ in range(self.config.accumulation_steps - 1):
                         loss, num_tokens = self.step(data_loader, self.config.accumulation_steps, num_tokens, tau, progress, split="train")
-                        accumulated_loss += loss
+                        accumulated_loss += float(loss)
 
                 loss, num_tokens = self.step(
                     data_loader, self.config.accumulation_steps,
                     num_tokens, tau, progress, split="train"
                 )
-                accumulated_loss += loss.detach()
+                accumulated_loss += float(loss)
                 
-                norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0) #ToDO
+                norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
 
                 optimizer.step()
                 optimizer.zero_grad()
@@ -358,7 +385,7 @@ class Trainer():
 
                 # Logging 
                 if self.master_process:
-                    print(f"Epoch: {epoch} | Step: {step} |  loss: {accumulated_loss.item():.4f} | norm: {norm:.4f} | lr: {scheduler.get_last_lr()[0]} | tok/s: {tokens_per_sec}")
+                    print(f"Epoch: {epoch} | Step: {step} |  loss: {accumulated_loss:.4f} | norm: {norm:.4f} | lr: {scheduler.get_last_lr()[0]} | tok/s: {tokens_per_sec} | progress: {progress}")
                 
                 # Evaluation 
                 if self.master_process and ((step>0 and step % self.config.eval_interval == 0) or step == last_step):
@@ -375,7 +402,8 @@ class Trainer():
                 # Save Chekpoints
                 if self.master_process and ((step % self.config.checkpoints_frequency == 0 and step > 0) or step == last_step):
                     self.save_checkpoints(optimizer, self.config.path_to_checkpoints, name=str((epoch+1) * step))
-    
+        if self.ddp:
+            dist.destroy_process_group()
     def eval(self, data_loader):
         """
         Evaluates model on validation split using running average of
@@ -387,24 +415,31 @@ class Trainer():
 
         with torch.no_grad():
             for _ in range(self.steps_for_eval):
+                # 1) Get a validation batch
                 x0 = data_loader.next_batch(split="val").to(self.device)
 
+                # 2) Sample time and corrupt with absorbing noise
                 tau = torch.rand(1, device=self.device)
                 tau = tau.clamp(min=eps)
                 xt = self._apply_mask_noise(x0, tau)
 
+                # 3) Full bidirectional attention at eval
                 attn_mask = self._get_mask_for_step(
                     seq_len=xt.size(1),
                     progress=1.0,    # fully annealed mask
                 )
 
+                # 4) Masked positions = where xt == [MASK] (excluding pad)
                 masked_positions = (xt == self.masked_token_id)
                 if self.pad_token_id is not None:
                     masked_positions &= (x0 != self.pad_token_id)
 
+                # It *can* happen there are no masked tokens for very small tau;
+                # skip those batches so we don't step on stale gradients.
                 if masked_positions.sum() == 0:
                     continue
 
+                # 5) Forward + loss, scaled by 1/tau
                 with torch.autocast(device_type=self.device.type, dtype=self.dtype):
                     _, loss = self.model(xt, x0, attn_mask, masked_positions)
                     loss = loss / tau.to(loss.dtype)

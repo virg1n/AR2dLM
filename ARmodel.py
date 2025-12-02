@@ -90,15 +90,18 @@ class GroupedQueryAttention(nn.Module):
         self.num_rep = self.num_heads // self.num_kv_heads
         self.head_dim = config.num_dims // self.num_heads
 
+        # FIX: Use config.attention_bias to determine if Linear layers need bias
         self.wq = nn.Linear(config.num_dims, config.num_dims, bias=config.attention_bias)
         self.wk = nn.Linear(config.num_dims, self.num_kv_heads * self.head_dim, bias=config.attention_bias)
         self.wv = nn.Linear(config.num_dims, self.num_kv_heads * self.head_dim, bias=config.attention_bias)
         
+        # Initialize weights (standard practice, though we load pretrained later)
         # Only init weight, bias is init by default if it exists
         nn.init.normal_(self.wq.weight, mean=0, std=1/math.sqrt(config.num_dims))
         nn.init.normal_(self.wk.weight, mean=0, std=1/math.sqrt(config.num_dims))
         nn.init.normal_(self.wv.weight, mean=0, std=1/math.sqrt(config.num_dims))
         
+        # FIX: Use config.attention_out_bias
         self.wo = nn.Linear(config.num_dims, config.num_dims, bias=config.attention_out_bias)
 
     def rotate_half(self, x):
@@ -259,48 +262,78 @@ class Transformer(nn.Module):
     @torch.no_grad()
     def generate(self, idx: torch.Tensor, max_new_tokens: int, steps: int = 50, temperature: float = 1.0):
         """
-        generation for the Diffusion Language Model.
+        Performs iterative denoising (generation) for the Diffusion Language Model.
+        Implements an Absorbing Discrete Diffusion sampler (similar to MaskGIT).
+        
+        Args:
+            idx: Input prompt tensor [Batch, Prompt_Len]
+            max_new_tokens: Number of tokens to generate
+            steps: Number of diffusion steps (refinement iterations)
+            temperature: Sampling temperature (1.0 = normal, 0.0 = greedy)
         """
         self.eval()
         B, T_prompt = idx.shape
         T_total = T_prompt + max_new_tokens
-
+        
+        # 1. Initialize sequence with the prompt and fill the rest with MASK tokens
+        # We assume config.mask_token_id is defined (usually 0 or specific ID)
         x = torch.full((B, T_total), self.config.mask_token_id, device=idx.device, dtype=torch.long)
         x[:, :T_prompt] = idx
         
-
+        # 2. Iterative Denoising Loop
+        # We go from t=1 (full noise) to t=0 (clean) effectively
         for step in range(steps):
+            # Calculate progress (0.0 to 1.0)
             progress = (step + 1) / steps
-
+            
+            # Cosine schedule for mask ratio (starts at 1.0, ends at 0.0)
+            # Determines how many tokens should remain masked at this step
             mask_ratio = np.cos(progress * np.pi / 2)
             num_to_mask = int(max_new_tokens * mask_ratio)
-
+            
+            # 2a. Forward Pass
+            # We pass the full sequence 'x'. The model uses bidirectional attention 
+            # (attn_mask=None usually implies full attention in this architecture).
             logits, _ = self.forward(x)
             
-  
-            gen_logits = logits[:, T_prompt:, :] 
+            # 2b. Focus on the generation part only
+            # The model's _right_shift ensures logits[:, i] predicts x[:, i].
+            gen_logits = logits[:, T_prompt:, :] # [B, New_Tokens, Vocab]
             
+            # 2c. Sample Candidates
             if temperature > 0:
                 probs = torch.softmax(gen_logits / temperature, dim=-1)
+                # Sample from the distribution
                 pred_ids = torch.multinomial(probs.view(-1, self.config.vocab_size), 1).view(B, max_new_tokens)
+                # Calculate confidence: probability of the sampled token
                 pred_probs = torch.gather(probs, -1, pred_ids.unsqueeze(-1)).squeeze(-1)
             else:
+                # Greedy decoding (temperature=0)
                 probs = torch.softmax(gen_logits, dim=-1)
                 pred_ids = torch.argmax(probs, dim=-1)
                 pred_probs = torch.max(probs, dim=-1).values
 
-
+            # 2d. Update Sequence
+            # Temporarily fill ALL generated slots with the new predictions
             x[:, T_prompt:] = pred_ids
             
+            # If this is the last step, we are done
             if step == steps - 1:
                 break
-
+                
+            # 2e. Re-masking (The core of iterative decoding)
+            # We keep the 'most confident' predictions and re-mask the rest.
             if num_to_mask > 0:
-
+                # Find the indices of the 'num_to_mask' tokens with the LOWEST confidence
+                # topk with largest=False gives smallest values
                 _, mask_indices = torch.topk(pred_probs, k=num_to_mask, dim=1, largest=False)
- 
+                
+                # We need to apply these masks to 'x'. 
+                # Convert local indices (0 to max_new_tokens) to global indices (T_prompt to T_total)
                 global_mask_indices = mask_indices + T_prompt
                 
+                # Scatter the mask token back into x at the low-confidence positions
+                # x.scatter_(dim, index, src)
                 x.scatter_(1, global_mask_indices, self.config.mask_token_id)
 
         return x
