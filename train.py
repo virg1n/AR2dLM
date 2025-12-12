@@ -35,6 +35,9 @@ def load_qwen_into_custom_model(
     print("Loading tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
 
+    # --------------------------
+    # Ensure dedicated <MASK> token
+    # --------------------------
     if tokenizer.mask_token is None:
         vocab = tokenizer.get_vocab()
         if "<MASK>" in vocab:
@@ -46,6 +49,7 @@ def load_qwen_into_custom_model(
             num_added = tokenizer.add_special_tokens(special_tokens)
             print(f"Added {num_added} new special token(s): {special_tokens}")
 
+        # Resize HF model embeddings to match new vocab size
         hf_model.resize_token_embeddings(len(tokenizer))
     else:
         print(f"Tokenizer already has a mask token: {tokenizer.mask_token}")
@@ -55,11 +59,14 @@ def load_qwen_into_custom_model(
         mask_token_id = tokenizer.convert_tokens_to_ids("<MASK>")
     print("Using mask_token_id:", mask_token_id)
 
+    # IMPORTANT: true total vocab size (includes added specials)
     vocab_size_total = hf_model.get_input_embeddings().weight.size(0)
     print("HF embedding vocab size (total):", vocab_size_total)
     print("tokenizer.vocab_size (base):", tokenizer.vocab_size)
     print("len(tokenizer) (total):", len(tokenizer))
 
+    # ---- Build custom config (must match HF model) ----
+    # Use vocab_size_total (or len(tokenizer)), NOT tokenizer.vocab_size
     model_config = ModelConfig(
         vocab_size=vocab_size_total,
         num_dims=hf_config.hidden_size,
@@ -83,6 +90,7 @@ def load_qwen_into_custom_model(
     print(f"Initializing custom Transformer with config: {model_config}")
     custom_model = Transformer(model_config).to(dtype=torch.float16)
 
+    # ---- Copy weights from HF model to custom model ----
     hf_sd = hf_model.state_dict()
     custom_sd = custom_model.state_dict()
 
@@ -149,11 +157,13 @@ def load_qwen_into_custom_model(
     if missing_in_custom:
         print("WARNING: some custom keys not found:", missing_in_custom)
 
+    # Cleanup HF model to free memory
     del hf_model
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
+    # Move custom model to the training device/dtype
     custom_model = custom_model.to(device=device, dtype=dtype)
 
     return custom_model, tokenizer, mask_token_id, vocab_size_total
@@ -165,12 +175,12 @@ def main():
     parser.add_argument(
         "--dataset_path",
         type=str,
-        default="./fine_code", 
+        default="./fine_code",  # default matches download_dataset.py
         help="Path to tokenized Datatrove dataset (folder that contains .ds files).",
     )
     parser.add_argument("--output_dir", type=str, default="./checkpoints")
     parser.add_argument("--num_epochs", type=int, default=1)
-    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--batch_size", type=int, default=6)
     parser.add_argument("--max_seq_len", type=int, default=2048)
     parser.add_argument("--learning_rate", type=float, default=2e-4)
     parser.add_argument("--warmup_ratio", type=float, default=0.01)
@@ -184,7 +194,7 @@ def main():
         help="Training compute dtype.",
     )
     parser.add_argument("--mask_token_id", type=int, default=0)
-    parser.add_argument("--adap_factor", type=float, default=0.9)
+    parser.add_argument("--adap_factor", type=float, default=1)
     parser.add_argument("--num_epochs_total", type=int, help="Alias for --num_epochs", default=None)
 
     args = parser.parse_args()
@@ -204,6 +214,7 @@ def main():
 
     print(f"Using device: {device}, dtype: {dtype}")
 
+    # 1. Load base AR model & tokenizer, then wrap into your custom Transformer
     model, tokenizer, mask_token_id, vocab_size_total = load_qwen_into_custom_model(
         model_id=args.model_id,
         device=device,
@@ -214,6 +225,7 @@ def main():
     print("tokenier's mask token: ")
     print(tokenizer.convert_ids_to_tokens(151665))
 
+    # 2. Build TrainerConfig (this drives DataLoader + Trainer)
     pad_token_id = tokenizer.pad_token_id
     if pad_token_id is None:
         pad_token_id = tokenizer.eos_token_id
@@ -237,19 +249,23 @@ def main():
         adap_factor=args.adap_factor,
     )
 
+    # Make sure checkpoint + log directories exist
     os.makedirs(trainer_config.path_to_checkpoints, exist_ok=True)
     log_dir = os.path.dirname(trainer_config.eval_log_file)
     if log_dir:
         os.makedirs(log_dir, exist_ok=True)
 
+    # 3. Build DataLoader and Trainer
     trainer = Trainer(trainer_config, model, tokenizer)
 
+    # 4. Then build DataLoader with the correct rank/world_size
     data_loader = DataLoader(
         trainer_config,
         rank=trainer.ddp_rank,
         world_size=trainer.ddp_world_size,
     )
 
+    # 5. Train
     try:
         trainer.train(data_loader)
     except KeyboardInterrupt:

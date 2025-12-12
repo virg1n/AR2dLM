@@ -27,21 +27,21 @@ class TrainerConfig:
     use_dtype: str = "bfloat16"
 
     seed: int = 1998                
-    max_seq_len: int = 1024         # maximum context length for batch
+    max_seq_len: int = 2048         # maximum context length for batch
     batch_size: int = 1             # numbe of batches
     accumulation_steps: int = 1
     
     # Optimizer parameters
-    weight_decay: float = 0.1
+    weight_decay: float = 0.01
     warmup_ratio: float = 0.01
     learning_rate: float = 1e-3
     betas: Tuple[float, float] = (0.90, 0.95)
 
     val_ratio: int = 0.005
     steps_for_eval: int = 20                            # number of steps for evaluation
-    eval_interval: int = 300
+    eval_interval: int = 200
 
-    checkpoints_frequency: int = 10000
+    checkpoints_frequency: int = 2_000
     path_to_checkpoints: str = "./model_testing"        # path to directory to save checkpoints
 
     tokenized_dataset_path: str = ""                    # path to directory with tokeized dataset
@@ -96,8 +96,10 @@ class DataLoader():
     def get_batch(self, current_idx: int, start_idx: int, end_idx: int):
         new_idx = current_idx + self.config.batch_size
         
-        x_l =  [self.dataset[idx]['input_ids']
-                    for idx in range(current_idx, min(new_idx, self.len_dataset))]
+        x_l = [
+            self.dataset[idx]['input_ids']
+            for idx in range(current_idx, min(new_idx, end_idx))
+        ]
         x = torch.stack(x_l)
     
         if new_idx >= end_idx:
@@ -310,10 +312,42 @@ class Trainer():
             print(f"loss_before_divide: {loss}")
             loss = loss / tau.to(loss.dtype)
 
+
         loss = loss / accumulation_steps
 
         loss.backward()
         return loss.detach(), num_tokens
+
+    # def step(self, data_loader, accumulation_steps: int,
+    #      num_tokens: int, tau: torch.Tensor, progress: float,
+    #      split: str = "train"):
+    
+    #     x0 = data_loader.next_batch(split=split).to(self.device)
+    #     xt = self._apply_mask_noise(x0, tau)
+    
+    #     num_tokens += torch.numel(x0)
+    
+    #     attn_mask = self._get_mask_for_step(seq_len=xt.size(1), progress=progress)
+    #     masked_positions = (xt == self.masked_token_id)
+    #     if self.pad_token_id is not None:
+    #         masked_positions &= (x0 != self.pad_token_id)
+    
+    #     if masked_positions.sum() == 0:
+    #         return torch.tensor(0.0, device=self.device), num_tokens
+    #     masked_positions[:, 0] = False
+    
+    #     with torch.autocast(device_type=self.device.type, dtype=self.dtype):
+    #         # raw CE loss
+    #         _, raw_loss = self.model(xt, x0, attn_mask, masked_positions)
+    
+    #     # diffusion weighting 1/t
+    #     weighted_loss = raw_loss / tau.to(raw_loss.dtype)
+    
+    #     # scale for grad accumulation
+    #     loss = weighted_loss / accumulation_steps
+    #     loss.backward()
+    
+    #     return raw_loss.detach(), num_tokens
 
     def train(self, data_loader):
         num_steps_per_epoch = math.ceil(data_loader.num_train_steps() / self.config.accumulation_steps)
@@ -348,11 +382,13 @@ class Trainer():
 
         last_step = num_steps_per_epoch - 1
         self.model.train()
-        eps = 1e-4
+        eps = 5e-4
+
+        print("TOTAL STEPS: ", num_steps_per_epoch * self.num_epochs)
 
         for epoch in range(self.num_epochs):
             for step in range(num_steps_per_epoch):
-                progress = min(step/(num_steps_per_epoch * self.adap_factor) + int(epoch), 1.0) * 2
+                progress = min(step/(num_steps_per_epoch * self.adap_factor) + int(epoch), 1.0)
 
                 tau = torch.rand(1, device=self.device)
                 tau = tau.clamp(min=eps)
@@ -386,6 +422,8 @@ class Trainer():
                 # Logging 
                 if self.master_process:
                     print(f"Epoch: {epoch} | Step: {step} |  loss: {accumulated_loss:.4f} | norm: {norm:.4f} | lr: {scheduler.get_last_lr()[0]} | tok/s: {tokens_per_sec} | progress: {progress}")
+                    with open("train_loss.txt", "a") as f:
+                        f.write(f"Epoch: {epoch} | Step: {step} |  loss: {accumulated_loss:.4f} | norm: {norm:.4f} | lr: {scheduler.get_last_lr()[0]} | tok/s: {tokens_per_sec} | progress: {progress}\nw")
                 
                 # Evaluation 
                 if self.master_process and ((step>0 and step % self.config.eval_interval == 0) or step == last_step):
@@ -394,6 +432,8 @@ class Trainer():
 
                     with open(self.config.eval_log_file, "a") as f:
                         f.write(f"Step: {step * (epoch+1)}, val_loss: {val_loss.item():.4f}, norm: {norm:.4f}, lr: {scheduler.get_last_lr()[0]}, time: {t1 - t0:.2f}s, tok/s: {tokens_per_sec:.1f} \n")
+
+                    
 
                     self.model.train()
                     if self.clean_cuda_cache:
@@ -409,7 +449,7 @@ class Trainer():
         Evaluates model on validation split using running average of
         first [steps_for_eval] batches under the same diffusion objective.
         """
-        eps = 1e-4
+        eps = 5e-4
         val_loss_accum = 0.0
         effective_steps = 0
 
@@ -454,13 +494,28 @@ class Trainer():
         return val_loss_accum / effective_steps
 
 
+    # def save_checkpoints(self, optimizer, path: str, name: str):
+    #     os.makedirs(path, exist_ok=True)
+    #     checkpoint_path = os.path.join(path, f"model.checkpoint.{name}.pt")
+    #     # self.model.save_pretrained(".checkpoint_path", config=config)
+    #     checkpoint = {
+    #                 'model': self.model.state_dict(),
+    #                 'optimizer':optimizer.state_dict(),
+    #             }
+    #     torch.save(checkpoint, checkpoint_path)
+    #     print("Checkpoints saved")
     def save_checkpoints(self, optimizer, path: str, name: str):
         os.makedirs(path, exist_ok=True)
         checkpoint_path = os.path.join(path, f"model.checkpoint.{name}.pt")
-        # self.model.save_pretrained(".checkpoint_path", config=config)
+    
+        if self.ddp:
+            model_state = self.model.module.state_dict()
+        else:
+            model_state = self.model.state_dict()
+    
         checkpoint = {
-                    'model': self.model.state_dict(),
-                    'optimizer':optimizer.state_dict(),
-                }
+            "model": model_state,
+            "optimizer": optimizer.state_dict(),
+        }
         torch.save(checkpoint, checkpoint_path)
         print("Checkpoints saved")
